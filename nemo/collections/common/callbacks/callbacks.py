@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import time
+import torch
 
 from pytorch_lightning.callbacks.base import Callback
 from pytorch_lightning.utilities import rank_zero_only
+
+from nemo.utils import logging
 
 
 class LogEpochTimeCallback(Callback):
@@ -30,3 +33,27 @@ class LogEpochTimeCallback(Callback):
         curr_time = time.time()
         duration = curr_time - self.epoch_start
         trainer.logger.log_metrics({"epoch_time": duration}, step=trainer.global_step)
+
+
+class StdoutMetricLogger(Callback):
+    """A callback to print a summary of metrics on_epoch_end"""
+
+    @rank_zero_only
+    def on_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        processed_metrics = {}
+        for k,v in metrics.items():
+            if isinstance(v, torch.Tensor):
+                processed_metrics[k] = v.item()
+            else:
+                processed_metrics[k] = v
+
+        processed_metrics["epoch"] = pl_module.current_epoch + 1
+        processed_metrics["global_step"] = pl_module.global_step + 1
+
+        logging.info("")
+        logging.info("EPOCH SUMMARY:")
+        logging.info("==============")
+        for k,v in processed_metrics.items():
+            logging.info(f"{k} = {v:.4f}")
+        logging.info("")

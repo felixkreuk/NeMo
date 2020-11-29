@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from nemo.collections.tts.helpers.helpers import OperationMode, remove
 from nemo.collections.tts.modules.submodules import Invertible1x1Conv, WaveNet
 from nemo.core.classes import Exportable, NeuralModule, typecheck
-from nemo.core.neural_types.elements import AudioSignal, MelSpectrogramType, NormalDistributionSamplesType, VoidType
+from nemo.core.neural_types.elements import AudioSignal, MelSpectrogramType, NormalDistributionSamplesType, VoidType, LogDeterminantType
 from nemo.core.neural_types.neural_type import NeuralType
 
 
@@ -94,34 +94,18 @@ class UniGlowModule(NeuralModule, Exportable):
     def input_types(self):
         return {
             "spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()),
-            "audio": NeuralType(('B', 'T'), AudioSignal(), optional=True),
+            "audio": NeuralType(('B', 'T'), AudioSignal()),
             "sigma": NeuralType(optional=True),
         }
 
     @property
     def output_types(self):
-        if self.mode == OperationMode.training or self.mode == OperationMode.validation:
-            return {
-                "pred_normal_dist": NeuralType(('B', 'flowgroup', 'T'), NormalDistributionSamplesType()),
-                "logdet": NeuralType(elements_type=VoidType()),
-                "audio_pred": NeuralType(('B', 'T'), AudioSignal()),
-            }
-        else:
-            return {
-                "audio": NeuralType(('B', 'T'), AudioSignal()),
-            }
+        return {
+            "pred_normal_dist": NeuralType(('B', 'flowgroup', 'T'), NormalDistributionSamplesType()),
+            "logdet": NeuralType(elements_type=LogDeterminantType()),
+        }
 
-    def input_example(self):
-        """
-        Generates input examples for tracing etc.
-        Returns:
-            A tuple of input examples.
-        """
-        par = next(self.parameters())
-        mel = torch.randn((1, self.n_mel_channels, 96), device=par.device, dtype=par.dtype)
-        return tuple([mel])
-
-    def audio_to_normal_dist(self, *, spec: torch.Tensor, audio: torch.Tensor) -> (torch.Tensor, float):
+    def forward(self, *, spec: torch.Tensor, audio: torch.Tensor) -> (torch.Tensor, float):
         logdet = 0
 
         spec = spec[:, :, :-1]
@@ -147,7 +131,7 @@ class UniGlowModule(NeuralModule, Exportable):
 
         return audio, logdet
 
-    def norm_dist_to_audio(self, *, spec, sigma: float = 1.0):
+    def infer(self, *, spec, sigma: float = 1.0):
         spec = spec[:, :, :-1]
         audio_len = spec.shape[2] * self.upsample_factor
         spec = F.interpolate(spec, size=audio_len)

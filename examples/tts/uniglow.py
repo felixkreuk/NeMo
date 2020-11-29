@@ -14,7 +14,7 @@
 
 import pytorch_lightning as pl
 
-from nemo.collections.common.callbacks import LogEpochTimeCallback
+from nemo.collections.common.callbacks import LogEpochTimeCallback, StdoutMetricLogger
 from nemo.collections.tts.models import UniGlowModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -24,8 +24,7 @@ from nemo.utils.exp_manager import exp_manager
 @hydra_runner(config_path="conf", config_name="uniglow")
 def main(cfg):
     trainer = pl.Trainer(**cfg.trainer)
-    epoch_time_logger = LogEpochTimeCallback()
-    trainer.callbacks.extend([epoch_time_logger])
+    trainer.callbacks.extend([LogEpochTimeCallback(), StdoutMetricLogger()])
     exp_manager(trainer, cfg.get("exp_manager", None))
 
     if cfg.resume_from_ckpt is None:

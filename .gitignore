@@ -1,3 +1,6 @@
+.vim
+nemo_experiments
+.hydra
 # log and data files
 *.model
 *.pkl

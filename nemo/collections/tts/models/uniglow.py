@@ -15,16 +15,19 @@
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+import numpy as np
+import time
 import torch
+from torchaudio.transforms import MFCC
 from hydra.utils import instantiate
 from omegaconf import MISSING, DictConfig, OmegaConf, open_dict
 from pystoi import stoi
 from pytorch_lightning.loggers import LoggerCollection, TensorBoardLogger
 
 from nemo.collections.tts.helpers.helpers import OperationMode, waveglow_log_to_tb_func
-from nemo.collections.tts.losses.uniglowloss import UniGlowLoss
 from nemo.collections.tts.models.base import Vocoder
 from nemo.collections.tts.modules.uniglow import UniGlowModule
+from nemo.collections.tts.modules.gan_modules import MultiScaleDiscriminator, MultiPeriodDiscriminator, discriminator_loss, generator_loss, feature_loss
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.neural_types.elements import (
     AudioSignal,
@@ -37,97 +40,50 @@ from nemo.core.neural_types.neural_type import NeuralType
 from nemo.utils import logging
 
 
-@dataclass
-class WaveglowConfig:
-    waveglow: Dict[Any, Any] = MISSING
-    preprocessor: Dict[Any, Any] = MISSING
-    sigma: float = MISSING
-    train_ds: Optional[Dict[Any, Any]] = None
-    validation_ds: Optional[Dict[Any, Any]] = None
-
-
 class UniGlowModel(Vocoder):
-    """Waveglow model used to convert betweeen spectrograms and audio"""
+    """UniGlow model used to convert betweeen spectrograms and audio"""
 
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
         if isinstance(cfg, dict):
             cfg = OmegaConf.create(cfg)
         super().__init__(cfg=cfg, trainer=trainer)
 
-        schema = OmegaConf.structured(WaveglowConfig)
-        # ModelPT ensures that cfg is a DictConfig, but do this second check in case ModelPT changes
-        if isinstance(cfg, dict):
-            cfg = OmegaConf.create(cfg)
-        elif not isinstance(cfg, DictConfig):
-            raise ValueError(f"cfg was type: {type(cfg)}. Expected either a dict or a DictConfig")
-        # Ensure passed cfg is compliant with schema
-        OmegaConf.merge(cfg, schema)
-
+        self.removed_weightnorm = False
         self.sigma = self._cfg.sigma
         self.audio_to_melspec_precessor = instantiate(self._cfg.preprocessor)
         self.model = UniGlowModule(
-            self._cfg.uniglow.n_mel_channels,
-            self._cfg.uniglow.n_flows,
-            self._cfg.uniglow.n_group,
-            self._cfg.uniglow.n_wn_channels,
-            self._cfg.uniglow.n_wn_layers,
-            self._cfg.uniglow.wn_kernel_size,
+            self._cfg.n_mel_channels,
+            self._cfg.n_flows,
+            self._cfg.n_group,
+            self._cfg.n_wn_channels,
+            self._cfg.n_wn_layers,
+            self._cfg.wn_kernel_size,
             self.get_upsample_factor(),
         )
-        self.mode = OperationMode.infer
-        self.loss = UniGlowLoss(self._cfg.uniglow.stft_loss_coef)
-        self.removed_weightnorm = False
 
-    @property
-    def mode(self):
-        return self._mode
-
-    @mode.setter
-    def mode(self, new_mode):
-        if new_mode == OperationMode.training:
-            self.train()
-        else:
-            self.eval()
-        self._mode = new_mode
-        self.model.mode = new_mode
+        self.nll_loss = instantiate(cfg.nll_loss)
+        self.stft_loss = instantiate(cfg.stft_loss)
+        
+        if cfg.adv_loss_coef > 0:
+            self.msd = MultiScaleDiscriminator()
+            self.mpd = MultiPeriodDiscriminator()
 
     @property
     def input_types(self):
         return {
-            "audio": NeuralType(('B', 'T'), AudioSignal()),
-            "audio_len": NeuralType(('B'), LengthsType()),
+            "spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()),
+            "sigma": NeuralType(optional=True),
         }
 
     @property
     def output_types(self):
-        if self.mode == OperationMode.training or self.mode == OperationMode.validation:
-            output_dict = {
-                "pred_normal_dist": NeuralType(('B', 'flowgroup', 'T'), NormalDistributionSamplesType()),
-                "logdet": NeuralType(elements_type=LogDeterminantType()),
-                "predicted_audio": NeuralType(('B', 'T'), AudioSignal()),
-            }
-            if self.mode == OperationMode.validation:
-                output_dict["spec"] = NeuralType(('B', 'T', 'D'), MelSpectrogramType())
-                output_dict["spec_len"] = NeuralType(('B'), LengthsType())
-            return output_dict
         return {
-            "audio_pred": NeuralType(('B', 'T'), AudioSignal()),
+            "audio": NeuralType(('B', 'S', 'T'), AudioSignal(self.sample_rate)),
         }
 
     @typecheck()
-    def forward(self, *, audio, audio_len):
-        if self.mode != self.model.mode:
-            raise ValueError(
-                f"WaveGlowModel's mode {self.mode} does not match WaveGlowModule's mode {self.model.mode}"
-            )
-        spec, spec_len = self.audio_to_melspec_precessor(audio, audio_len)
-        tensors = self.model(spec=spec, audio=audio, sigma=self.sigma)
-        if self.mode == OperationMode.training:
-            return tensors  # z, logdet, audio_pred
-        elif self.mode == OperationMode.validation:
-            z, logdet, audio_pred = tensors
-            return z, logdet, audio_pred, spec, spec_len
-        return tensors
+    def forward(self, *, spec: torch.Tensor, sigma: float = 1.0):
+        return self.model.infer(spec=spec, sigma=sigma)
 
     @typecheck(
         input_types={"spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()), "sigma": NeuralType(optional=True)},
@@ -137,66 +93,102 @@ class UniGlowModel(Vocoder):
         if not self.removed_weightnorm:
             self.waveglow.remove_weightnorm()
             self.removed_weightnorm = True
-        self.mode = OperationMode.infer
-
-        with torch.no_grad():
-            audio = self.model(spec=spec, audio=None, sigma=sigma)
-
+        audio = self.infer(spec=spec, audio=None, sigma=sigma)
         return audio
 
     def training_step(self, batch, batch_idx):
-        self.mode = OperationMode.training
         audio, audio_len = batch
-        z, logdet, predicted_audio = self(audio=audio, audio_len=audio_len)
-        loss = self.loss(z=z, logdet=logdet, gt_audio=audio, predicted_audio=predicted_audio, sigma=self.sigma)
-        output = {
-            'loss': loss,
-            'progress_bar': {'training_loss': loss},
-            'log': {'loss': loss},
+        spec, spec_len = self.audio_to_melspec_precessor(audio, audio_len)
+
+        z, logdet = self.model(spec=spec, audio=audio)
+        predicted_audio = self.model.infer(spec=spec, sigma=self.sigma)
+
+        nll_loss = self.nll_loss(z=z, logdet=logdet, sigma=self.sigma)
+        stft_loss = self.stft_loss(x=predicted_audio, y=audio)
+
+        loss = self._cfg.nll_loss_coef * nll_loss + \
+               self._cfg.stft_loss_coef * stft_loss
+
+        metrics = {
+            "nll_loss": nll_loss,
+            "stft_loss": stft_loss,
         }
-        return output
+
+        # vocoder adversarial loss term
+        if self._cfg.adv_loss_coef > 0:
+            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(audio.unsqueeze(1), predicted_audio.unsqueeze(1))
+            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(audio.unsqueeze(1), predicted_audio.unsqueeze(1))
+            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+            loss_gen_all = loss_gen_f + loss_gen_s
+            if self._cfg.fm_loss:
+                loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+                loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+                loss_fm = loss_fm_s + loss_fm_f
+                loss_gen_all += loss_fm
+                metrics["fm_loss"] = loss_fm
+            loss += self._cfg.adv_loss_coef * loss_gen_all
+            metrics["gen_loss"] = loss_gen_all
+
+        self.manual_backward(loss, self.optimizer)
+        self.manual_optimizer_step(self.optimizer)
+
+        if self._cfg.adv_loss_coef > 0:
+            # mpd
+            y_df_hat_r, y_df_hat_g, _, _ = self.mpd(audio.unsqueeze(1), predicted_audio.detach().unsqueeze(1))
+            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
+            # msd
+            y_ds_hat_r, y_ds_hat_g, _, _ = self.msd(audio.unsqueeze(1), predicted_audio.detach().unsqueeze(1))
+            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
+
+            # compute overall discriminator loss
+            d_loss = loss_disc_s + loss_disc_f
+
+            metrics.update({
+                "msd_loss": loss_disc_s,
+                "mpd_loss": loss_disc_f,
+                "d_loss": d_loss
+            })
+            self.manual_backward(d_loss, self.d_optimizer)
+            self.manual_optimizer_step(self.d_optimizer)
+
+        self.log_dict(metrics, on_step=False, on_epoch=True)
+        return {}
 
     def validation_step(self, batch, batch_idx):
-        self.mode = OperationMode.validation
         audio, audio_len = batch
-        z, logdet, predicted_audio, spec, spec_len = self(audio=audio, audio_len=audio_len)
-        loss = self.loss(z=z, logdet=logdet, gt_audio=audio, predicted_audio=predicted_audio, sigma=self.sigma)
+        spec, spec_len = self.audio_to_melspec_precessor(audio, audio_len)
 
-        # compute average stoi score for batch
-        stoi_score = 0
-        sr = self._cfg.preprocessor.params.sample_rate
-        for audio_i, audio_recon_i in zip(audio.cpu(), predicted_audio.cpu()):
-            stoi_score += stoi(audio_i, audio_recon_i, sr)
-        stoi_score /= audio.shape[0]
+        z, logdet = self.model(spec=spec, audio=audio)
+        predicted_audio = self.model.infer(spec=spec, sigma=self.sigma)
 
-        return {
-            "val_loss": loss,
-            "predicted_audio": predicted_audio,
-            "mel_target": spec,
-            "mel_len": spec_len,
-            "stoi": stoi_score,
+        sr = self._cfg.preprocessor.sample_rate
+        nll_loss = self.nll_loss(z=z, logdet=logdet, sigma=self.sigma)
+        stft_loss = self.stft_loss(x=predicted_audio, y=audio)
+        stoi_score = np.mean([stoi(a.cpu(),b.cpu(),sr) for a,b in zip(audio, predicted_audio)])
+        mfcc_fn = MFCC(sample_rate=sr).to(spec.device)
+        mfcc_distance = torch.mean(torch.abs(mfcc_fn(audio) - mfcc_fn(predicted_audio)))
+
+        metrics = {
+            f"val_nll_loss": nll_loss,
+            f"val_stft_loss": stft_loss,
+            f"val_stoi": torch.FloatTensor([stoi_score]),
+            f"val_mfcc_distance": mfcc_distance
         }
+        self.log_dict(metrics)
+
+    def training_epoch_end(self, outputs):
+        pass
 
     def validation_epoch_end(self, outputs):
-        if self.logger is not None and self.logger.experiment is not None:
-            tb_logger = self.logger.experiment
-            if isinstance(self.logger, LoggerCollection):
-                for logger in self.logger:
-                    if isinstance(logger, TensorBoardLogger):
-                        tb_logger = logger.experiment
-                        break
-            waveglow_log_to_tb_func(
-                tb_logger,
-                tuple(outputs[0].values())[:-1],
-                self.global_step,
-                tag="eval",
-                mel_fb=self.audio_to_melspec_precessor.fb,
-            )
-        avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-        avg_stoi = torch.FloatTensor([x['stoi'] for x in outputs]).mean()
-        tensorboard_logs = {'val_loss': avg_loss, 'stoi': avg_stoi}
-        logging.info(f"Validation summary | Epoch {self.current_epoch} | NLL {avg_loss:.2f} | STOI: {avg_stoi:.2f}")
-        return {'val_loss': avg_loss, 'log': tensorboard_logs}
+        pass
+
+    def configure_optimizers(self):
+        optimizers = []
+        self.optimizer = instantiate(self._cfg.optimizer, params=self.model.parameters())
+        if self._cfg.adv_loss_coef > 0:
+            d_params = list(self.msd.parameters()) + list(self.mpd.parameters())
+            self.d_optimizer = instantiate(self._cfg.optimizer, params=d_params)
 
     def __setup_dataloader_from_config(self, cfg, shuffle_should_be: bool = True, name: str = "train"):
         if "dataset" not in cfg or not isinstance(cfg.dataset, DictConfig):
@@ -248,9 +240,9 @@ class UniGlowModel(Vocoder):
         Returns:
             An integer representing the upsampling factor
         """
-        audio = torch.ones(1, self._cfg.train_ds.dataset.params.n_segments)
+        audio = torch.ones(1, self._cfg.train_ds.dataset.n_segments)
         spec, spec_len = self.audio_to_melspec_precessor(audio, torch.FloatTensor([len(audio)]))
         spec = spec[:, :, :-1]
-        audio = audio.unfold(1, self._cfg.uniglow.n_group, self._cfg.uniglow.n_group).permute(0, 2, 1)
+        audio = audio.unfold(1, self._cfg.n_group, self._cfg.n_group).permute(0, 2, 1)
         upsample_factor = audio.shape[2] // spec.shape[2]
         return upsample_factor
