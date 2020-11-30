@@ -15,6 +15,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+import wandb
 import numpy as np
 import time
 import torch
@@ -68,6 +69,18 @@ class UniGlowModel(Vocoder):
             self.msd = MultiScaleDiscriminator()
             self.mpd = MultiPeriodDiscriminator()
 
+        #  ckpt = torch.load("/home/tlv/workspace/nemo/nemo_experiments/UniGlow/547022/checkpoints/last.ckpt")
+        #  sd = ckpt["state_dict"]
+        #  self.load_state_dict(sd, strict=False)
+
+        logging.info("")
+        logging.info("UNIGLOW:")
+        logging.info("========")
+        logging.info(f"flows: {cfg.n_flows}")
+        logging.info(f"channels: {cfg.n_wn_channels}")
+        logging.info(f"groups: {cfg.n_group}")
+        logging.info("")
+
     @property
     def input_types(self):
         return {
@@ -85,10 +98,7 @@ class UniGlowModel(Vocoder):
     def forward(self, *, spec: torch.Tensor, sigma: float = 1.0):
         return self.model.infer(spec=spec, sigma=sigma)
 
-    @typecheck(
-        input_types={"spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()), "sigma": NeuralType(optional=True)},
-        output_types={"audio": NeuralType(('B', 'T'), AudioSignal())},
-    )
+    @typecheck(output_types={"audio": NeuralType(('B', 'T'), AudioSignal())})
     def convert_spectrogram_to_audio(self, spec: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
         if not self.removed_weightnorm:
             self.waveglow.remove_weightnorm()
@@ -176,6 +186,25 @@ class UniGlowModel(Vocoder):
             f"val_mfcc_distance": mfcc_distance
         }
         self.log_dict(metrics)
+
+        # log audio and spects
+        if self.logger is not None and \
+           self.logger.experiment is not None and \
+           batch_idx == 0:
+            real_spec = spec.cpu()[0]
+            real_spec = torch.flip(real_spec, dims=[0])
+            generated_spec = self.audio_to_melspec_precessor(predicted_audio, audio_len)[0].cpu()[0]
+            generated_spec = torch.flip(generated_spec, dims=[0])
+            self.logger.experiment.log({
+                "audio": [
+                    wandb.Audio(audio.cpu()[0], caption="real audio", sample_rate=sr),
+                    wandb.Audio(predicted_audio.cpu()[0], caption="generated audio", sample_rate=sr)
+                ],
+                "specs": [
+                    wandb.Image(real_spec, caption="real audio"),
+                    wandb.Image(generated_spec, caption="generated audio")
+                ],
+            })
 
     def training_epoch_end(self, outputs):
         pass

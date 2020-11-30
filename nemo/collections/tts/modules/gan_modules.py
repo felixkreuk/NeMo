@@ -29,6 +29,10 @@ import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
 
+from nemo.core.classes import NeuralModule
+from nemo.core.neural_types.elements import AudioSignal, MelSpectrogramType, VoidType
+from nemo.core.neural_types.neural_type import NeuralType
+
 LRELU_SLOPE = 0.1
 
 
@@ -42,7 +46,46 @@ def init_weights(m, mean=0.0, std=0.01):
         m.weight.data.normal_(mean, std)
 
 
-class DiscriminatorP(torch.nn.Module):
+class MultiPeriodDiscriminator(NeuralModule):
+    def __init__(self):
+        super(MultiPeriodDiscriminator, self).__init__()
+        self.discriminators = nn.ModuleList([
+            DiscriminatorP(2),
+            DiscriminatorP(3),
+            DiscriminatorP(5),
+            DiscriminatorP(7),
+            DiscriminatorP(11),
+        ])
+
+    @property
+    def output_types(self):
+        return {
+            "audio": NeuralType(('B', 'T'), AudioSignal()),
+        }
+    @property
+    def output_types(self):
+        return {
+            "scores": NeuralType(("B", "T"), VoidType()),
+            "feature_maps": NeuralType(("B", "C", "H", "W"), VoidType()),
+        }
+
+    def forward(self, y, y_hat):
+        y_d_rs = []
+        y_d_gs = []
+        fmap_rs = []
+        fmap_gs = []
+        for i, d in enumerate(self.discriminators):
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            fmap_rs.append(fmap_r)
+            y_d_gs.append(y_d_g)
+            fmap_gs.append(fmap_g)
+
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+
+class DiscriminatorP(NeuralModule):
     def __init__(self, period, kernel_size=5, stride=3, use_spectral_norm=False):
         super(DiscriminatorP, self).__init__()
         self.period = period
@@ -55,6 +98,18 @@ class DiscriminatorP(torch.nn.Module):
             norm_f(Conv2d(1024, 1024, (kernel_size, 1), 1, padding=(2, 0))),
         ])
         self.conv_post = norm_f(Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
+
+    @property
+    def output_types(self):
+        return {
+            "audio": NeuralType(('B', 'T'), AudioSignal()),
+        }
+    @property
+    def output_types(self):
+        return {
+            "scores": NeuralType(("B", "T"), VoidType()),
+            "feature_maps": NeuralType(("B", "C", "H", "W"), VoidType()),
+        }
 
     def forward(self, x):
         fmap = []
@@ -78,34 +133,7 @@ class DiscriminatorP(torch.nn.Module):
         return x, fmap
 
 
-class MultiPeriodDiscriminator(torch.nn.Module):
-    def __init__(self):
-        super(MultiPeriodDiscriminator, self).__init__()
-        self.discriminators = nn.ModuleList([
-            DiscriminatorP(2),
-            DiscriminatorP(3),
-            DiscriminatorP(5),
-            DiscriminatorP(7),
-            DiscriminatorP(11),
-        ])
-
-    def forward(self, y, y_hat):
-        y_d_rs = []
-        y_d_gs = []
-        fmap_rs = []
-        fmap_gs = []
-        for i, d in enumerate(self.discriminators):
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
-            y_d_rs.append(y_d_r)
-            fmap_rs.append(fmap_r)
-            y_d_gs.append(y_d_g)
-            fmap_gs.append(fmap_g)
-
-        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
-
-
-class DiscriminatorS(torch.nn.Module):
+class DiscriminatorS(NeuralModule):
     def __init__(self, use_spectral_norm=False):
         super(DiscriminatorS, self).__init__()
         norm_f = weight_norm if use_spectral_norm == False else spectral_norm
@@ -120,6 +148,21 @@ class DiscriminatorS(torch.nn.Module):
         ])
         self.conv_post = norm_f(Conv1d(1024, 1, 3, 1, padding=1))
 
+    @property
+    def output_types(self):
+        return {
+            "real_audio": NeuralType(('B', 'T'), AudioSignal()),
+            "fake_audio": NeuralType(('B', 'T'), AudioSignal()),
+        }
+    @property
+    def output_types(self):
+        return {
+            "real_scores": NeuralType(("B", "T"), VoidType()),
+            "fake_scores": NeuralType(("B", "T"), VoidType()),
+            "real_feature_maps": NeuralType(("B", "C", "H", "W"), VoidType()),
+            "fake_feature_maps": NeuralType(("B", "C", "H", "W"), VoidType()),
+        }
+
     def forward(self, x):
         fmap = []
         for l in self.convs:
@@ -133,7 +176,7 @@ class DiscriminatorS(torch.nn.Module):
         return x, fmap
 
 
-class MultiScaleDiscriminator(torch.nn.Module):
+class MultiScaleDiscriminator(NeuralModule):
     def __init__(self):
         super(MultiScaleDiscriminator, self).__init__()
         self.discriminators = nn.ModuleList([
@@ -145,6 +188,21 @@ class MultiScaleDiscriminator(torch.nn.Module):
             AvgPool1d(4, 2, padding=2),
             AvgPool1d(4, 2, padding=2)
         ])
+
+    @property
+    def output_types(self):
+        return {
+            "real_audio": NeuralType(('B', 'T'), AudioSignal()),
+            "fake_audio": NeuralType(('B', 'T'), AudioSignal()),
+        }
+    @property
+    def output_types(self):
+        return {
+            "real_scores": NeuralType(("B", "T"), VoidType()),
+            "fake_scores": NeuralType(("B", "T"), VoidType()),
+            "real_feature_maps": NeuralType(("B", "C", "H", "W"), VoidType()),
+            "fake_feature_maps": NeuralType(("B", "C", "H", "W"), VoidType()),
+        }
 
     def forward(self, y, y_hat):
         y_d_rs = []

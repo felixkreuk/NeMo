@@ -101,8 +101,14 @@ trainer:
 exp_manager:
   exp_dir: null
   name: *name
-  create_tensorboard_logger: True
+  version: ???
+  create_wandb_logger: True
   create_checkpoint_callback: True
+  create_tensorboard_logger: False
+  wandb_logger_kwargs:
+    project: uniglow
+    name: ${exp_manager.name}_${env:NGC_JOB_ID}${env:SLURM_JOB_ID}
+    tags: {exp_manager.name}
   checkpoint_callback_params:
     monitor: val_stoi
     save_top_k: 3
