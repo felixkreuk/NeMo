@@ -7,6 +7,9 @@ train_dataset: ???
 validation_datasets: ???
 n_mels: 80
 
+defaults:
+  - model/generator: v1
+
 model:
   train_ds:
     dataset:
@@ -58,6 +61,7 @@ model:
     stft_exact_pad: true
     stft_conv: false
     window: hann
+    use_grads: true
 
   optim:
     lr: 0.0002
@@ -65,28 +69,20 @@ model:
     adam_b2: 0.99
     lr_decay: 0.999
 
-  generator:
-    _target_: nemo.collections.tts.modules.hifigan_modules.Generator
-    resblock: 1
-    upsample_rates: [8,8,2,2]
-    upsample_kernel_sizes: [16,16,4,4]
-    upsample_initial_channel: 512
-    resblock_kernel_sizes: [3,7,11]
-    resblock_dilation_sizes: [[1,3,5], [1,3,5], [1,3,5]]
-  
 trainer:
   gpus: -1 # number of gpus
-  max_epochs: ???
+  max_epochs: 1000000
   num_nodes: 1
   accelerator: ddp
   accumulate_grad_batches: 1
   checkpoint_callback: False  # Provided by exp_manager
   logger: False  # Provided by exp_manager
   log_every_n_steps: 100
-  check_val_every_n_epoch: 1
+  check_val_every_n_epoch: 5
+  automatic_optimization: false
 
 exp_manager:
-  exp_dir: null
+  exp_dir: /results
   name: ${name}
   create_tensorboard_logger: false
   create_checkpoint_callback: True
@@ -95,8 +91,9 @@ exp_manager:
   use_datetime_version: false
   resume_if_exists: true
   resume_ignore_no_checkpoint: true
+  resume_past_end: true
   
   create_wandb_logger: true
   wandb_logger_kwargs:
     project: hifi
-    name: hifi_name
+    name: ${exp_manager.version}
