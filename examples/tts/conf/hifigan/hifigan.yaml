@@ -67,7 +67,7 @@ model:
 
 trainer:
   gpus: -1 # number of gpus
-  max_epochs: 1000000
+  max_steps: ${model.max_steps}
   num_nodes: 1
   accelerator: ddp
   accumulate_grad_batches: 1
